@@ -14,6 +14,12 @@ output "traefik_ip" {
   value = azurerm_public_ip.traefik.ip_address
 }
 
+output "cloudflare_dns_records" {
+  value = {
+    for k, rec in cloudflare_dns_record.aks_dns : k => rec.name
+  }
+}
+
 output "grafana_user" {
   value = var.GRAFANA_USER
 }
