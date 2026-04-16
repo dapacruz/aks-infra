@@ -15,9 +15,12 @@ output "traefik_ip" {
 }
 
 output "cloudflare_dns_records" {
-  value = {
-    for k, rec in cloudflare_dns_record.aks_dns : k => rec.name
-  }
+  value = module.customer1.dns_record_names
+}
+
+output "grafana_dns_record" {
+  description = "Hostname of the Grafana DNS record."
+  value       = cloudflare_dns_record.grafana.name
 }
 
 output "grafana_user" {
