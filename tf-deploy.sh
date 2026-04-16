@@ -16,7 +16,7 @@ STORAGE_ACCOUNT=$(terraform output -raw storage_account_name)
 cd ../infra
 
 echo -en "\nInitializing infra ..."
-until terraform init -backend-config="backend.tfbackend" &>/dev/null; do
+until terraform init -backend-config="./config.azurerm.tfbackend" &>/dev/null; do
     echo -n "."
     rm -fr .terraform .terraform.lock.hcl
     sleep 10

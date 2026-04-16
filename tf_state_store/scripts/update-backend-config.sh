@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-FILE="../infra/backend.tfbackend"
+FILE="../infra/config.azurerm.tfbackend"
 
 perl -i -pe "s|^storage_account_name\s*=.*|storage_account_name = \"$STORAGE_ACCOUNT_NAME\"|" "$FILE"
 perl -i -pe "s|^container_name\s*=.*|container_name = \"$CONTAINER_NAME\"|"                   "$FILE"

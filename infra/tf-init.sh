@@ -2,5 +2,5 @@
 
 set -e
 
-terraform init -backend-config="backend.tfbackend"
+terraform init -backend-config="./config.azurerm.tfbackend"
 
