@@ -1,6 +1,6 @@
 # AKS Infrastructure
 
-Production-grade Azure Kubernetes Service (AKS) infrastructure provisioning using Terraform with GitOps integration, multi-tenant support, and comprehensive security features.
+Terraform for an Azure Kubernetes Service (AKS) staging cluster (`orion-staging`) with Flux GitOps, Azure Key Vault secrets, Cloudflare DNS and per-customer backup storage.
 
 ## Table of Contents
 
@@ -11,6 +11,7 @@ Production-grade Azure Kubernetes Service (AKS) infrastructure provisioning usin
 - [Getting Started](#getting-started)
 - [Deployment](#deployment)
 - [Infrastructure Components](#infrastructure-components)
+- [Terraform State Backend](#terraform-state-backend)
 - [Multi-Tenant Customer Module](#multi-tenant-customer-module)
 - [GitOps Integration](#gitops-integration)
 - [Security](#security)
@@ -22,135 +23,155 @@ Production-grade Azure Kubernetes Service (AKS) infrastructure provisioning usin
 
 ## Overview
 
-This repository manages the complete lifecycle of an Azure Kubernetes Service (AKS) cluster named `orion-staging` with:
+This repository has two independent Terraform root modules:
 
-- **Infrastructure as Code**: Terraform-based provisioning and management
-- **GitOps**: Flux CD integration for continuous deployment
-- **Multi-Tenancy**: Reusable customer module for isolated tenant resources
-- **Security**: Azure Key Vault, RBAC, and Azure AD integration
-- **Monitoring**: Grafana dashboards with Telegram alerting
-- **Backup**: CNPG database backup integration with Azure Storage
-- **DNS Management**: Cloudflare integration for domain configuration
+| Directory | Purpose | State |
+|-----------|---------|-------|
+| `tf_state_store/` | Storage account, service principal and custom role used as the remote backend for `infra/` | Local |
+| `infra/` | AKS cluster, Key Vault, backup storage, Flux, Cloudflare DNS and customer modules | Remote (Azure Storage) |
 
-**Cluster Specifications:**
-- **Name**: orion-staging
-- **Location**: West US 2
-- **Kubernetes Version**: Latest stable with auto-upgrade
-- **Node Pools**: 2 system nodes + 2 user nodes (Standard_D2s_v3)
-- **CNI**: Cilium with network policies
+What `infra/` provisions:
+
+- **AKS cluster** `orion-staging` in West US 2 (Cilium data plane and network policy, Azure AD RBAC, OIDC issuer)
+- **Flux** via the AKS `microsoft.flux` extension, syncing [dapacruz/orion-gitops](https://github.com/dapacruz/orion-gitops)
+- **Key Vault** (RBAC-authorized) holding Grafana and per-customer secrets, surfaced to the cluster through the Key Vault secrets provider
+- **CNPG backup storage** with one blob container, SAS token and set of credentials per customer
+- **Static public IP** for the Traefik ingress and **Cloudflare** A records pointing at it
+
+Grafana, Traefik and the CNPG clusters themselves are deployed by Flux from the GitOps repository, not by this repository.
 
 ## Architecture
 
+### Resource Layout
+
+Each resource group is labelled with the Terraform root module that manages it. `MC_*` is the resource group AKS creates for the cluster's nodes and load balancer.
+
+```mermaid
+flowchart TB
+    subgraph sub["Azure subscription (West US 2)"]
+        subgraph state["RG orionXXXXXX · tf_state_store"]
+            tfsa["Terraform state storage<br/>GRS, Azure AD auth only<br/>container: tfstate"]
+            sp["Service principal + custom role<br/>ABAC: tfstate/aks-infra/*"]
+        end
+
+        subgraph infra["RG aks-infra · infra"]
+            aks["AKS cluster: orion-staging<br/>system pool: 2 x Standard_D2s_v3<br/>user pool: 2 x Standard_D2s_v3<br/>Azure CNI + Cilium, Azure AD RBAC, OIDC<br/>Flux extension"]
+            kv["Key Vault<br/>kv-orion-staging-Cv1N<br/>grafana-* and per-customer secrets"]
+            bk["CNPG backup storage<br/>orionbackupsstgcv1n<br/>one container per customer"]
+        end
+
+        subgraph node["RG MC_* · AKS-managed"]
+            ip["Public IP<br/>traefik-ingress"]
+        end
+    end
+
+    gh["GitHub<br/>dapacruz/orion-gitops"]
+    cf["Cloudflare DNS<br/>grafana.* and customer records"]
+
+    sp -->|"state read/write"| tfsa
+    gh -->|"Flux sync, every 5 min"| aks
+    kv -->|"Key Vault secrets provider"| aks
+    ip -->|"Traefik LoadBalancer"| aks
+    cf -->|"A records"| ip
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                          Azure Cloud                            │
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │              AKS Cluster (orion-staging)                  │  │
-│  │                                                           │  │
-│  │  ┌──────────────┐  ┌──────────────┐                       │  │
-│  │  │ System Pool  │  │  User Pool   │                       │  │
-│  │  │ (2 nodes)    │  │  (2 nodes)   │                       │  │
-│  │  └──────────────┘  └──────────────┘                       │  │
-│  │                                                           │  │
-│  │  CNI: Cilium  │  Network Policies: Enabled                │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │             Supporting Infrastructure                     │  │
-│  │                                                           │  │
-│  │  ┌─────────────┐  ┌────────────┐  ┌──────────────────┐    │  │
-│  │  │ Key Vault   │  │  Storage   │  │  Public IP       │    │  │
-│  │  │ (Secrets)   │  │  (Backups) │  │  (Traefik)       │    │  │
-│  │  └─────────────┘  └────────────┘  └──────────────────┘    │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │     Terraform State Storage (tf_state_store)              │  │
-│  │     - Azure Storage Account                               │  │
-│  │     - Versioning & Change Feed Enabled                    │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                          │
-                          │ GitOps (Flux CD)
-                          ▼
-          ┌──────────────────────────────┐
-          │   GitHub Repository          │
-          │   dapacruz/orion-gitops      │
-          │   (Cluster Manifests)        │
-          └──────────────────────────────┘
-                          │
-                          │ DNS Management
-                          ▼
-          ┌──────────────────────────────┐
-          │       Cloudflare             │
-          │   - Grafana DNS              │
-          │   - Customer DNS             │
-          └──────────────────────────────┘
+
+### Runtime Flows
+
+Flux deploys the workloads (cert-manager, CNPG, Traefik, kube-prometheus-stack and the customer apps) from the GitOps repository. Terraform supplies the secrets, backup storage and cluster variables they depend on.
+
+```mermaid
+flowchart LR
+    tf["Terraform<br/>infra/"]
+    gh["GitHub<br/>orion-gitops"]
+    client["Client"]
+
+    subgraph azure["Azure"]
+        kv["Key Vault"]
+        bk["Backup storage<br/>container per customer"]
+        ip["Traefik public IP"]
+    end
+
+    cf["Cloudflare DNS<br/>DNS only"]
+
+    subgraph aks["AKS orion-staging"]
+        flux["Flux<br/>flux-system"]
+        apps["cert-manager, CNPG, Traefik,<br/>kube-prometheus-stack (Grafana),<br/>customer workloads"]
+        pods["Pods"]
+    end
+
+    tf -->|"grafana-* and customer secrets"| kv
+    tf -->|"container + SAS"| bk
+    tf -->|"cluster-vars ConfigMap"| flux
+    tf -->|"A records"| cf
+
+    kv -->|"secrets provider<br/>(Key Vault Secrets User)"| pods
+    gh -->|"sync every 5 min"| flux
+    flux -->|"deploys"| apps
+    apps -->|"CNPG backups"| bk
+
+    client --> cf --> ip --> apps
 ```
 
 ## Prerequisites
 
 ### Required Tools
 
-- [Terraform](https://www.terraform.io/downloads.html) >= 1.14
-- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) >= 2.0
-- [kubectl](https://kubernetes.io/docs/tasks/tools/) >= 1.28
-- [kubelogin](https://github.com/Azure/kubelogin) for Azure AD authentication
-- Bash shell (macOS/Linux or WSL on Windows)
+- [Terraform](https://www.terraform.io/downloads.html) `~> 1.14`
+- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli)
+- [kubectl](https://kubernetes.io/docs/tasks/tools/)
+- [kubelogin](https://github.com/Azure/kubelogin), required by the Terraform `kubernetes` provider as well as `kubectl`
+- [Flux CLI](https://fluxcd.io/flux/installation/) (optional, for troubleshooting)
+- Bash and Perl (macOS/Linux or WSL). The deploy scripts and the backend-config helper use both.
 
 ### Azure Requirements
 
-- Azure subscription with Owner or Contributor access
-- Azure AD tenant with appropriate permissions
-- Service Principal or Managed Identity for Terraform authentication
-- Azure AD group for AKS administrators
+- Azure subscription where you can create resource groups, role definitions and role assignments (Owner, or Contributor plus User Access Administrator)
+- Azure AD permissions to create applications, service principals and secrets (used by `tf_state_store`)
+- An Azure AD group for AKS administrators. Its object ID is currently hardcoded in `infra/aks.tf` and `tf_state_store/storage.tf`, so change it there to use your own group.
 
 ### External Services
 
-- **Cloudflare Account**: For DNS management
-  - Zone configured for your domain
-  - API token with DNS edit permissions
-- **GitHub Repository**: For GitOps (https://github.com/dapacruz/orion-gitops)
-- **Telegram Bot** (optional): For Grafana alerting
+- **Cloudflare**: a zone for your domain and an API token with DNS edit permission
+- **GitHub**: the GitOps repository configured in `infra/flux.tf`
+- **Telegram bot** (optional): its token and chat ID are stored in Key Vault for Grafana alerting
 
 ## Repository Structure
 
 ```
 aks-infra/
-├── tf_state_store/              # Terraform remote state backend
+├── tf_state_store/                  # Terraform remote state backend
 │   ├── scripts/
-│   │   └── update-backend-config.sh   # Backend configuration updater
-│   ├── main.tf                  # Provider configuration
-│   ├── storage.tf               # Azure Storage for state files
-│   ├── variables.tf             # Variable definitions
-│   ├── outputs.tf               # Output values
-│   ├── condition.tpl            # RBAC condition template
-│   └── secrets.auto.tfvars      # Sensitive variables (git-ignored)
+│   │   └── update-backend-config.sh # Writes ../infra/config.azurerm.tfbackend
+│   ├── main.tf                      # Providers
+│   ├── storage.tf                   # Storage account, container, SP, custom role
+│   ├── infra-backend.tf             # Runs update-backend-config.sh after apply
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── condition.tpl                # ABAC condition scoping the SP to aks-infra/*
+│   └── secrets.auto.tfvars.example
 │
-├── infra/                       # Main AKS infrastructure
+├── infra/                           # Main AKS infrastructure
 │   ├── modules/
-│   │   └── customer/            # Multi-tenant customer module
-│   │       ├── main.tf          # Customer resources
-│   │       ├── variables.tf     # Module inputs
-│   │       └── outputs.tf       # Module outputs
-│   ├── main.tf                  # Provider & backend configuration
-│   ├── aks.tf                   # AKS cluster definition
-│   ├── key-vault.tf             # Azure Key Vault
-│   ├── backups.tf               # CNPG backup storage
-│   ├── flux.tf                  # Flux GitOps configuration
-│   ├── cloudflare.tf            # DNS records
-│   ├── customers.tf             # Customer instantiation
-│   ├── variables.tf             # Variable definitions
-│   ├── outputs.tf               # Output values
-│   ├── tf-init.sh               # Manual initialization script
-│   ├── config.azurerm.tfbackend # Backend config (git-ignored)
-│   └── secrets.auto.tfvars      # Sensitive variables (git-ignored)
+│   │   └── customer/                # Per-customer module
+│   │       ├── main.tf
+│   │       ├── variables.tf
+│   │       └── outputs.tf
+│   ├── main.tf                      # Providers and azurerm backend
+│   ├── aks.tf                       # Resource group, cluster, node pools, Traefik IP
+│   ├── key-vault.tf                 # Key Vault, role assignments, Grafana secrets
+│   ├── backups.tf                   # CNPG backup storage account
+│   ├── flux.tf                      # Flux extension, configuration, cluster-vars
+│   ├── cloudflare.tf                # Grafana DNS record
+│   ├── customers.tf                 # Customer module instances
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── tf-init.sh                   # terraform init with the backend config
+│   ├── config.azurerm.tfbackend.example
+│   └── secrets.auto.tfvars.example
 │
-├── tf-deploy.sh                 # Automated deployment script
-├── tf-undeploy.sh               # Automated destruction script
-├── .gitignore                   # Git exclusions
-└── README.md                    # This file
+├── tf-deploy.sh                     # Full deployment
+├── tf-undeploy.sh                   # Full teardown
+└── README.md
 ```
 
 ## Getting Started
@@ -162,9 +183,15 @@ git clone <repository-url>
 cd aks-infra
 ```
 
-### 2. Configure Secrets
+### 2. Create Local Config Files
 
-Create `secrets.auto.tfvars` files in both directories:
+Copy the example files. The real files are git-ignored (`*.tfvars`, `*.tfbackend`).
+
+```bash
+cp tf_state_store/secrets.auto.tfvars.example tf_state_store/secrets.auto.tfvars
+cp infra/secrets.auto.tfvars.example          infra/secrets.auto.tfvars
+cp infra/config.azurerm.tfbackend.example     infra/config.azurerm.tfbackend
+```
 
 **tf_state_store/secrets.auto.tfvars:**
 ```hcl
@@ -173,14 +200,16 @@ ARM_SUBSCRIPTION_ID = "your-subscription-id"
 
 **infra/secrets.auto.tfvars:**
 ```hcl
-ARM_SUBSCRIPTION_ID    = "your-subscription-id"
-CLOUDFLARE_API_TOKEN   = "your-cloudflare-api-token"
-CLOUDFLARE_ZONE_ID     = "your-cloudflare-zone-id"
-GRAFANA_ADMIN_USER     = "admin"
-GRAFANA_ADMIN_PASSWORD = "your-secure-password"
-GRAFANA_TELEGRAM_TOKEN = "your-telegram-bot-token"
-GRAFANA_TELEGRAM_CHATID = "your-telegram-chat-id"
+ARM_SUBSCRIPTION_ID        = "your-subscription-id"
+CLOUDFLARE_API_TOKEN       = "your-cloudflare-api-token"
+CLOUDFLARE_ZONE_ID         = "your-cloudflare-zone-id"
+GRAFANA_USER               = "admin"
+GRAFANA_PASSWORD           = "your-secure-password"
+GRAFANA_TELEGRAM_BOT_TOKEN = "your-telegram-bot-token"
+GRAFANA_TELEGRAM_CHAT_ID   = "your-telegram-chat-id"
 ```
+
+`infra/config.azurerm.tfbackend` does not need editing. `tf_state_store` fills it in when it is applied (see [Terraform State Backend](#terraform-state-backend)), and the file must already exist for that to work.
 
 ### 3. Authenticate with Azure
 
@@ -193,38 +222,79 @@ az account set --subscription "your-subscription-id"
 
 ### Automated Deployment
 
-The easiest way to deploy the entire infrastructure:
-
 ```bash
 ./tf-deploy.sh
 ```
 
-This script will:
-1. Initialize and deploy the Terraform state backend
-2. Extract storage account credentials
-3. Initialize main infrastructure with remote backend
-4. Deploy AKS cluster and all resources
-5. Configure kubectl with cluster credentials
+The script runs with `set -e` and **`terraform apply -auto-approve`**, so it will not prompt before creating resources. It:
+
+1. Runs `terraform init` and `apply` in `tf_state_store/`, which also updates `infra/config.azurerm.tfbackend`
+2. Reads the storage account and container names from the outputs
+3. Runs `terraform init -backend-config=./config.azurerm.tfbackend` in `infra/`, retrying every 10 seconds until it succeeds (the new role assignment can take time to propagate)
+4. Waits until the state blob has no lock
+5. Runs `terraform apply` in `infra/`
+6. Runs `az aks get-credentials` for the new cluster
+
+```mermaid
+flowchart TD
+    deploy["tf-deploy.sh"]
+
+    subgraph s1["1. tf_state_store (local state)"]
+        a1["terraform init + apply<br/>storage account, container,<br/>service principal, custom role"]
+        a2["scripts/update-backend-config.sh"]
+        a1 --> a2
+    end
+
+    cfg["infra/config.azurerm.tfbackend"]
+
+    subgraph s2["2. infra (remote state, Azure AD auth)"]
+        b1["terraform init<br/>retries until the role assignment propagates"]
+        b2["wait for the state lock to clear"]
+        b1 --> b2
+
+        subgraph apply["terraform apply (resource dependencies)"]
+            rg["Resource group"] --> aks["AKS cluster"]
+            aks --> pool["User node pool"]
+            aks --> ip["Traefik public IP"]
+            aks --> kv["Key Vault + role assignments"]
+            pool --> fx["Flux extension"]
+            fx --> fc["Flux configuration"]
+            fx --> cv["cluster-vars ConfigMap"]
+            kv --> gs["Grafana secrets"]
+            bk["Backup storage"] --> cust["module.customerN<br/>container, SAS, DB creds, DNS"]
+            kv --> cust
+            ip --> cust
+            ip --> gd["Grafana DNS record"]
+        end
+        b2 --> apply
+    end
+
+    creds["az aks get-credentials"]
+
+    deploy --> a1
+    a2 -->|"writes"| cfg
+    cfg --> b1
+    apply --> creds
+```
 
 ### Manual Deployment
 
-#### Step 1: Deploy State Backend
+#### Step 1: Deploy the State Backend
 
 ```bash
 cd tf_state_store
 terraform init
-terraform plan
 terraform apply
 ```
 
-#### Step 2: Configure Backend for Main Infrastructure
+#### Step 2: Initialize the Main Infrastructure
 
 ```bash
 cd ../infra
 ./tf-init.sh
 ```
 
-#### Step 3: Deploy Main Infrastructure
+#### Step 3: Deploy the Main Infrastructure
 
 ```bash
 terraform plan
@@ -243,168 +313,144 @@ az aks get-credentials \
 ### Verify Deployment
 
 ```bash
-# Check cluster access
 kubectl get nodes
-
-# Verify Flux installation
 kubectl get pods -n flux-system
-
-# Check customer resources
-kubectl get namespaces | grep customer
+kubectl get configmap cluster-vars -n flux-system -o yaml
 ```
 
 ## Infrastructure Components
 
-### AKS Cluster (aks.tf:1)
+### AKS Cluster (`infra/aks.tf`)
 
-- **Cluster Name**: orion-staging
-- **Location**: West US 2
-- **Resource Group**: aks-infra
-- **Kubernetes Version**: Auto-upgrade enabled (patch + node image)
-- **SKU Tier**: Standard
+- **Name**: `orion-staging` (DNS prefix `staging`), resource group `aks-infra`, West US 2
+- **Identity**: system-assigned managed identity
+- **Kubernetes version**: not pinned, so the AKS default applies; `automatic_upgrade_channel = "patch"`
+- **OIDC issuer**: enabled
 
-**Node Pools:**
-- **System Pool** (agentpool):
-  - Size: Standard_D2s_v3
-  - Count: 2 nodes
-  - Taints: CriticalAddonsOnly=true:NoSchedule
-  - OS: Ubuntu Linux
-  - Auto-scaling: Disabled
-
-- **User Pool** (userpool):
-  - Size: Standard_D2s_v3
-  - Count: 2 nodes
-  - OS: Ubuntu Linux
-  - Auto-scaling: Disabled
+**Node pools** (both `Standard_D2s_v3`, fixed 2 nodes, no autoscaling, `max_surge` 33%):
+- **System pool** (`agentpool`): `only_critical_addons_enabled`, so only critical add-ons schedule here
+- **User pool** (`userpool`): application workloads
 
 **Networking:**
-- Network Plugin: Azure CNI
-- Network Plugin Mode: Overlay
-- Network Policy: Cilium
-- Network Data Plane: Cilium
-- Service CIDR: 10.0.0.0/16
-- DNS Service IP: 10.0.0.10
+- Network plugin: `azure`
+- Network policy and data plane: `cilium`
 
 **Authentication:**
-- Azure RBAC: Enabled
-- OIDC Issuer: Enabled
-- Workload Identity: Enabled
-- Admin Group: 70633b4d-738d-4cf5-9298-2308c86be097
+- Azure AD integration with Azure RBAC enabled
+- Admin group (object ID in `aks.tf`) is also assigned *Azure Kubernetes Service Cluster Admin Role* on the cluster
 
-**Maintenance:**
-- Auto-upgrade Channel: patch
-- Node OS Upgrade Channel: NodeImage
-- Maintenance Window: Sunday 2:00 AM UTC (weekly)
+**Add-ons:**
+- Key Vault secrets provider (`secret_rotation_enabled = false`)
 
-### Azure Key Vault (key-vault.tf:1)
+**Maintenance windows** (auto-upgrade and node OS): weekly, Sunday 02:00 UTC, 4 hours. Node OS channel is `NodeImage`.
 
-Stores sensitive credentials and secrets:
+### Azure Key Vault (`infra/key-vault.tf`)
 
-- **Secrets Stored**:
-  - Grafana admin credentials
-  - Grafana Telegram integration
-  - Customer database passwords
-  - Blob SAS tokens
-  - Storage account names
+- **Name**: `kv-orion-staging-Cv1N`, `standard` SKU, RBAC authorization
+- **Soft delete**: 7 days. **Purge protection**: disabled.
+- **Role assignments**:
+  - The identity running Terraform: *Key Vault Administrator*
+  - The AKS Key Vault secrets provider identity: *Key Vault Secrets User*
 
-- **Security**:
-  - RBAC authorization enabled
-  - Soft delete: 7-day retention
-  - Purge protection: Enabled
-  - Public network access: Enabled
+**Secrets managed by Terraform:**
 
-- **Access**:
-  - AKS cluster: Key Vault Secrets User role
-  - Current user: Key Vault Administrator role
+| Secret | Source |
+|--------|--------|
+| `grafana-admin-user` | `GRAFANA_USER` |
+| `grafana-admin-password` | `GRAFANA_PASSWORD` |
+| `grafana-telegram-bot-token` | `GRAFANA_TELEGRAM_BOT_TOKEN` (value changes ignored after creation) |
+| `grafana-telegram-chat-id` | `GRAFANA_TELEGRAM_CHAT_ID` (value changes ignored after creation) |
+| `storage-account-name` | Shared CNPG backup storage account name |
+| `<customer>-db-user`, `<customer>-db-password`, `<customer>-blob-sas` | Customer module |
 
-### Storage Account - Backups (backups.tf:1)
+### Backup Storage Account (`infra/backups.tf`)
 
-Dedicated storage for CNPG database backups:
+- **Name**: `orionbackupsstgcv1n`
+- **Tier / replication**: Standard / LRS
+- **Minimum TLS**: 1.2
+- **Blob versioning**: enabled
+- No delete-retention or change-feed settings are configured.
 
-- **Account Name**: Dynamic (cnpgbackups + random suffix)
-- **Replication**: GRS (Geo-Redundant Storage)
-- **Access Tier**: Hot
-- **TLS Version**: 1.2 minimum
-- **Features**:
-  - Blob versioning enabled
-  - Change feed enabled
-  - Container delete retention: 7 days
-  - Blob delete retention: 7 days
+### Traefik Public IP (`infra/aks.tf`)
 
-### Public IP - Traefik Ingress (aks.tf:20)
+- **Name**: `traefik-ingress`, Standard SKU, static
+- Created in the cluster's node resource group so the Traefik load balancer service can use it
+- A destroy-time `local-exec` runs `kubectl delete service -n traefik traefik-traefik --ignore-not-found` so the IP is released cleanly (requires `kubectl` access to the cluster)
 
-Static public IP for ingress controller:
+### Cloudflare DNS (`infra/cloudflare.tf`)
 
-- **Name**: traefik-ingress
-- **SKU**: Standard
-- **Allocation**: Static
-- **Usage**: Ingress traffic routing
+- `grafana.orion-staging.dcinfrastructures.io` → Traefik IP (A record, DNS only)
+- Customer records are created by the customer module.
 
-### Cloudflare DNS (cloudflare.tf:1)
+## Terraform State Backend
 
-Manages DNS records:
+`tf_state_store/` creates:
 
-- **Grafana Dashboard**: grafana.orion-staging.dcinfrastructures.io
-- **Customer Records**: Configured per customer module
+- A resource group and storage account named `orion<6 random chars>` (GRS, TLS 1.2, shared key access disabled, Azure AD auth only)
+- A private `tfstate` container with versioning, a 90-day change feed and 30-day blob and container delete retention
+- An Azure AD application, service principal and password for Terraform to use as backend credentials
+- A custom role granting blob read/write plus user-delegation-key access, assigned to that service principal with an ABAC condition (`condition.tpl`) that limits writes to the `tfstate` container and blobs under `aks-infra/`
+- *Storage Blob Data Contributor* for the admin group
+- A `null_resource` that runs `scripts/update-backend-config.sh` to write the storage account, container, tenant, subscription and service principal credentials into `infra/config.azurerm.tfbackend`
+
+The `infra/` backend uses `key = "aks-infra/terraform.tfstate"` and `use_azuread_auth = true`.
+
+> **Note:** `tf_state_store` itself uses local state (`terraform.tfstate` in that directory, git-ignored). Losing it means losing track of the backend resources. The service principal secret is also written in plain text to the git-ignored backend config file and exposed as the `client_secret` output.
 
 ## Multi-Tenant Customer Module
 
-The customer module (infra/modules/customer/:1) provides isolated resources for each tenant.
+`infra/modules/customer/` provisions the per-customer resources needed by a CNPG cluster deployed through GitOps.
 
-### Module Features
+### Module Resources
 
-- Per-customer backup storage
-- Isolated database credentials
-- Custom DNS records
-- SAS token management
-- Key Vault integration
+1. **Storage container**: private container named after the customer in the shared backup account
+2. **SAS token**: container-scoped, HTTPS only, with read/write/delete/list/add/create permissions
+3. **Database password**: 24-character alphanumeric `random_password` (`ignore_changes = all`, so it is generated once)
+4. **Key Vault secrets**: `<customer>-blob-sas`, `<customer>-db-user`, `<customer>-db-password`
+5. **DNS records**: Cloudflare A records pointing at the Traefik IP, one per `dns_records` entry
 
 ### Module Inputs
 
 | Variable | Type | Description | Default |
 |----------|------|-------------|---------|
-| `customer_name` | string | Customer identifier | Required |
-| `db_user` | string | Database username | "app" |
-| `storage_account_id` | string | Shared storage account | Required |
-| `key_vault_id` | string | Azure Key Vault ID | Required |
-| `cloudflare_zone_id` | string | Cloudflare zone | Required |
-| `traefik_ip_address` | string | Ingress IP address | Required |
-| `dns_records` | map(object) | DNS records to create | {} |
-| `sas_validity_hours` | number | SAS token validity | 17520 (2 years) |
+| `customer_name` | string | Customer identifier, used in the container and secret names | Required |
+| `db_user` | string | Database username stored in Key Vault | `"app"` |
+| `storage_account_id` | string | Shared backup storage account ID | Required |
+| `storage_account_primary_connection_string` | string (sensitive) | Connection string used to generate the SAS token | Required |
+| `key_vault_id` | string | Key Vault ID | Required |
+| `kv_admin_role_assignment_id` | string | Role assignment ID, used only for `depends_on` ordering | Required |
+| `cloudflare_zone_id` | string | Cloudflare zone ID | Required |
+| `traefik_ip_address` | string | Traefik ingress IP | Required |
+| `dns_records` | map(object({name, proxied})) | DNS records to create | `{}` |
+| `sas_validity_hours` | number | SAS validity from the time of apply | `17520` (2 years) |
 
+### Module Outputs
 
-### Module Resources
-
-1. **Storage Container**: Per-customer blob container for backups
-2. **Database Secrets**: Auto-generated password stored in Key Vault
-3. **SAS Token**: Temporary credentials for blob access
-4. **DNS Records**: A records pointing to Traefik ingress
+`storage_container_name`, `sas_token` (sensitive), `db_password` (sensitive), `dns_record_names`.
 
 ### Adding a New Customer
 
-Edit `infra/customers.tf`:
+Add a module block to `infra/customers.tf`:
 
 ```hcl
 module "customer2" {
   source = "./modules/customer"
 
-  customer_name      = "customer2"
-  db_user            = "app"
-  storage_account_id = azurerm_storage_account.cnpg_backups.id
-  key_vault_id       = azurerm_key_vault.this.id
-  cloudflare_zone_id = var.CLOUDFLARE_ZONE_ID
-  traefik_ip_address = azurerm_public_ip.traefik_ingress.ip_address
+  customer_name                             = "customer2"
+  storage_account_id                        = azurerm_storage_account.cnpg_backups.id
+  storage_account_primary_connection_string = azurerm_storage_account.cnpg_backups.primary_connection_string
+  key_vault_id                              = azurerm_key_vault.orion_vault.id
+  kv_admin_role_assignment_id               = azurerm_role_assignment.kv_admin.id
+  cloudflare_zone_id                        = var.CLOUDFLARE_ZONE_ID
+  traefik_ip_address                        = azurerm_public_ip.traefik.ip_address
 
   dns_records = {
-    "customer2" = {
-      name    = "customer2.orion-staging.dcinfrastructures.io"
-      proxied = false
-    }
+    "customer2" = { name = "customer2.orion-staging.dcinfrastructures.io", proxied = false }
   }
 }
 ```
 
-Then apply:
+`infra/outputs.tf` currently exposes DNS names for `module.customer1` only. Add an output for the new module if you want them listed. Then apply:
 
 ```bash
 cd infra
@@ -414,205 +460,151 @@ terraform apply
 
 ### Accessing Customer Secrets
 
-Secrets are stored in Azure Key Vault with the following naming:
-
-- Database User: `{customer_name}-db-user`
-- Database Password: `{customer_name}-db-password`
-- SAS Token: `{customer_name}-blob-sas`
-- Storage Account: `{customer_name}-storage-account-name`
-- Storage Container: `{customer_name}-storage-container-name`
-
-Retrieve via Azure CLI:
-
 ```bash
 az keyvault secret show \
-  --vault-name <vault-name> \
+  --vault-name kv-orion-staging-Cv1N \
   --name customer1-db-password \
   --query value -o tsv
 ```
 
 ## GitOps Integration
 
-### Flux CD Configuration (flux.tf:1)
+### Flux Configuration (`infra/flux.tf`)
 
-- **Repository**: https://github.com/dapacruz/orion-gitops
-- **Branch**: main
-- **Kustomizations Path**: ./flux-system
-- **Sync Interval**: 5 minutes
-- **Scope**: Cluster-wide
+Flux is installed through the AKS `microsoft.flux` cluster extension (`orion-flux`), after the user node pool exists. The Flux configuration `orion-staging` then:
+
+- **Repository**: https://github.com/dapacruz/orion-gitops, branch `main`
+- **Kustomization**: `flux-system`, path `./flux-system`
+- **Sync interval**: 300 seconds
+- **Garbage collection**: enabled
+- **Scope**: cluster
 
 ### Cluster Variables
 
-A ConfigMap is created in the `flux-system` namespace with cluster-specific variables:
+Terraform creates a `cluster-vars` ConfigMap in `flux-system` so manifests can reference values that only exist after provisioning:
 
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cluster-vars
-  namespace: flux-system
-data:
-  AZURE_KEY_VAULT_NAME: <vault-name>
-  AZURE_LOCATION: westus2
-  CLUSTER_NAME: orion-staging
-  CLOUDFLARE_ZONE_ID: <zone-id>
-```
+| Key | Value |
+|-----|-------|
+| `AKS_KEYVAULT_IDENTITY_CLIENT_ID` | Client ID of the Key Vault secrets provider identity |
+| `AZURE_TENANT_ID` | Azure AD tenant ID |
+| `TRAEFIK_IP` | Traefik public IP address |
 
 ## Security
 
 ### Authentication & Authorization
 
-- **Azure AD Integration**: Cluster uses Azure AD for RBAC
-- **Admin Group**: Specific Azure AD group (ID: 70633b4d-738d-4cf5-9298-2308c86be097)
-- **Workload Identity**: OIDC-based authentication for pods
-- **Service Account Authentication**: Enabled for legacy workloads
-
-### Network Security
-
-- **Network Policies**: Cilium network policies enabled
-- **Network Plugin**: Cilium for advanced networking features
-- **Service Mesh Ready**: Cilium provides service mesh capabilities
+- **Azure AD integration** with Azure RBAC for Kubernetes authorization
+- **Admin group**: a single Azure AD group has cluster admin access and *Storage Blob Data Contributor* on the state storage account
+- **OIDC issuer** is enabled on the cluster
 
 ### Secrets Management
 
-- **Azure Key Vault**: Centralized secrets storage
-- **RBAC**: Role-based access control on vault
-- **Soft Delete**: 7-day retention for deleted secrets
-- **Purge Protection**: Prevents permanent deletion
+- **Key Vault** with RBAC authorization and 7-day soft delete
+- **Key Vault secrets provider** add-on on the cluster; the cluster identity only has *Key Vault Secrets User*
+- Customer database passwords are generated by Terraform and never hardcoded
 
-### Storage Security
+### State & Storage
 
-- **TLS 1.2**: Minimum TLS version enforced
-- **Encryption at Rest**: Azure-managed encryption
-- **SAS Tokens**: Time-limited access tokens
-- **Versioning**: Blob versioning enabled for audit trail
+- **State storage**: shared key access disabled, Azure AD auth only, TLS 1.2, versioning and change feed
+- **Backup storage**: TLS 1.2, blob versioning
+- **SAS tokens**: container-scoped and HTTPS only, but with a 2-year default lifetime
 
-### Best Practices
+### Known Caveats
 
-1. Rotate SAS tokens regularly (default: 2 years)
-2. Use Azure AD Pod Identity or Workload Identity for pod authentication
-3. Enable network policies for pod-to-pod communication
-4. Regularly update node images (automated via maintenance window)
-5. Review Key Vault access logs periodically
+- `infra/outputs.tf` exposes `grafana_user` and `grafana_password` without `sensitive = true`, so `terraform output` and `tf-deploy.sh` logs can print them.
+- Terraform state contains all generated secrets (DB passwords, SAS tokens, Grafana credentials). Restrict access to the state container.
+- Key Vault purge protection is disabled.
+- The Key Vault has no network restrictions configured.
 
 ## Monitoring
 
-### Grafana Dashboard
+Grafana itself is deployed by Flux from the GitOps repository. This repository provides:
 
-- **URL**: https://grafana.orion-staging.dcinfrastructures.io
-- **Credentials**: Stored in Azure Key Vault
-  - Secret: `grafana-admin-user`
-  - Secret: `grafana-admin-password`
-
-### Telegram Alerting
-
-Grafana integrates with Telegram for notifications:
-
-- **Bot Token**: Stored as `grafana-telegram-token`
-- **Chat ID**: Stored as `grafana-telegram-chatid`
-
-### Accessing Grafana Credentials
+- The DNS record `grafana.orion-staging.dcinfrastructures.io`
+- The Key Vault secrets Grafana consumes: `grafana-admin-user`, `grafana-admin-password`, `grafana-telegram-bot-token`, `grafana-telegram-chat-id`
 
 ```bash
-# Get admin username
-az keyvault secret show \
-  --vault-name $(terraform output -raw key_vault_name) \
-  --name grafana-admin-user \
-  --query value -o tsv
-
-# Get admin password
-az keyvault secret show \
-  --vault-name $(terraform output -raw key_vault_name) \
-  --name grafana-admin-password \
-  --query value -o tsv
+az keyvault secret show --vault-name kv-orion-staging-Cv1N --name grafana-admin-password --query value -o tsv
 ```
+
+The Telegram token and chat ID are only set on first creation. Later changes to `GRAFANA_TELEGRAM_*` are ignored by Terraform, so update those secrets directly in Key Vault.
 
 ## Backup and Recovery
 
 ### CNPG Database Backups
 
-- **Storage**: Azure Blob Storage (GRS)
-- **Retention**: 7 days (configurable)
-- **Access**: Per-customer SAS tokens
-- **Features**:
-  - Versioning enabled
-  - Change feed for audit
-  - Container-level isolation per customer
-
-### Backup Configuration
-
-Each customer has:
-- Dedicated storage container
-- SAS token for backup access
-- Credentials stored in Key Vault
+- **Storage**: one shared LRS storage account (`orionbackupsstgcv1n`) with blob versioning
+- **Isolation**: one private container per customer
+- **Access**: per-customer container SAS token stored in Key Vault as `<customer>-blob-sas`
+- **Retention**: no retention or lifecycle policy is configured here. Set it in the CNPG cluster or on the storage account.
 
 ### Restore Process
 
-1. Retrieve customer SAS token from Key Vault
-2. Access backup container using SAS token
-3. Use CNPG recovery procedures to restore from backup
+1. Retrieve the customer SAS token and storage account name (`storage-account-name`) from Key Vault
+2. Point the CNPG recovery configuration at the customer's container
+3. Restore using the standard CNPG recovery procedure
 
-### Terraform State Backups
+### Terraform State
 
-- **Backend**: Azure Storage
-- **Versioning**: Enabled
-- **Change Feed**: Enabled for audit trail
-- **Access**: RBAC-controlled with conditional access
+- **Backend**: Azure Storage (GRS) with versioning and a 90-day change feed
+- **Deletion protection**: 30-day blob and container soft delete
+- **Access**: service principal restricted by an ABAC condition to `aks-infra/*` in the `tfstate` container
 
 ## Configuration
 
 ### Terraform Variables
 
-**State Backend (tf_state_store/variables.tf:1):**
-- `ARM_SUBSCRIPTION_ID`: Azure subscription ID
+**`tf_state_store/variables.tf`**
+- `ARM_SUBSCRIPTION_ID`
 
-**Main Infrastructure (infra/variables.tf:1):**
-- `ARM_SUBSCRIPTION_ID`: Azure subscription ID
-- `CLOUDFLARE_API_TOKEN`: Cloudflare API token
-- `CLOUDFLARE_ZONE_ID`: Cloudflare zone ID
-- `GRAFANA_ADMIN_USER`: Grafana admin username
-- `GRAFANA_ADMIN_PASSWORD`: Grafana admin password
-- `GRAFANA_TELEGRAM_TOKEN`: Telegram bot token
-- `GRAFANA_TELEGRAM_CHATID`: Telegram chat ID
+**`infra/variables.tf`**
+- `ARM_SUBSCRIPTION_ID`
+- `CLOUDFLARE_API_TOKEN` (sensitive)
+- `CLOUDFLARE_ZONE_ID`
+- `GRAFANA_USER`
+- `GRAFANA_PASSWORD`
+- `GRAFANA_TELEGRAM_BOT_TOKEN`
+- `GRAFANA_TELEGRAM_CHAT_ID`
 
 ### Backend Configuration
 
-The `config.azurerm.tfbackend` file (git-ignored) should contain:
+`infra/config.azurerm.tfbackend` (git-ignored) follows `config.azurerm.tfbackend.example`:
 
 ```hcl
-storage_account_name = "tfstate<random>"
+client_id            = ""
+client_secret        = ""
 container_name       = "tfstate"
-key                  = "terraform.tfstate"
-tenant_id            = "your-tenant-id"
-subscription_id      = "your-subscription-id"
-client_id            = "your-client-id"
-client_secret        = "your-client-secret"
+storage_account_name = "orionXXXXXX"
+subscription_id      = ""
+tenant_id            = ""
+key                  = "aks-infra/terraform.tfstate"
 ```
 
-Update using the helper script:
+Applying `tf_state_store` fills in every field except `key`. If you need to rewrite it by hand, edit the file directly, then run `./tf-init.sh` from `infra/`. `update-backend-config.sh` reads its values from environment variables set by Terraform and is not meant to be run standalone.
 
-```bash
-cd tf_state_store/scripts
-./update-backend-config.sh
-```
+### Provider Versions
+
+| Provider | Version |
+|----------|---------|
+| terraform | `~> 1.14` |
+| azurerm | `~> 4.0` |
+| azuread | `~> 3.0` |
+| random | `~> 3.0` |
+| kubernetes | `~> 3.0` |
+| cloudflare | `~> 5.0` |
+| null (`tf_state_store` only) | `~> 3.0` |
 
 ## Maintenance
 
 ### Auto-Upgrade Schedule
 
-- **Maintenance Window**: Sunday 2:00 AM UTC (weekly)
-- **Kubernetes Patch**: Automatic
-- **Node OS**: Automatic
+- **Kubernetes patch upgrades** and **node image upgrades** run in a weekly window: Sunday 02:00 UTC, 4 hours
 
 ### Manual Upgrades
 
 ```bash
-# Check available versions
-az aks get-upgrades \
-  --resource-group aks-infra \
-  --name orion-staging
+az aks get-upgrades --resource-group aks-infra --name orion-staging
 
-# Upgrade cluster
 az aks upgrade \
   --resource-group aks-infra \
   --name orion-staging \
@@ -627,10 +619,7 @@ terraform plan
 terraform apply
 ```
 
-### Updating Customer Configuration
-
-1. Edit `infra/customers.tf`
-2. Plan and apply changes:
+### Updating a Single Customer
 
 ```bash
 cd infra
@@ -640,143 +629,125 @@ terraform apply -target=module.customer1
 
 ### Rotating SAS Tokens
 
-SAS tokens expire after 2 years (default). To rotate:
-
-```bash
-# Trigger recreation
-terraform taint 'module.customer1.azurerm_storage_container_sas.this'
-terraform apply
-```
+The SAS token comes from a data source that uses `timestamp()`, so **every `terraform apply` issues a new token** valid for `sas_validity_hours` from that time and updates the Key Vault secret. To rotate, run an apply. There is nothing to taint.
 
 ## Troubleshooting
 
-### Common Issues
-
-#### 1. Unable to Authenticate with AKS
+### 1. Unable to Authenticate with AKS
 
 ```bash
-# Re-authenticate with Azure
 az login
 kubelogin convert-kubeconfig -l azurecli
 
-# Refresh credentials
 az aks get-credentials \
   --resource-group aks-infra \
   --name orion-staging \
   --overwrite-existing
 ```
 
-#### 2. Terraform State Lock
+The Terraform `kubernetes` provider also shells out to `kubelogin get-token --login azurecli`, so `az login` must be current when applying `infra/`.
+
+### 2. `terraform init` Fails Against the Backend Right After Deploying the State Store
+
+Role assignments can take a few minutes to propagate. `tf-deploy.sh` retries automatically. Manually, wait and rerun `./tf-init.sh`.
+
+### 3. Terraform State Lock
+
+The azurerm backend stores locks as blob metadata.
 
 ```bash
-# List locks
-az lock list --resource-group <resource-group>
+az storage blob show \
+  --account-name <storage-account> \
+  --container-name tfstate \
+  --name aks-infra/terraform.tfstate \
+  --auth-mode login \
+  --query "properties.metadata.terraformlockid" -o tsv
 
-# Wait for automatic release or manually break (use with caution)
+# Only if you are sure no other run is active
 terraform force-unlock <lock-id>
 ```
 
-#### 3. Flux Not Syncing
+### 4. Flux Not Syncing
 
 ```bash
-# Check Flux status
 kubectl get pods -n flux-system
 kubectl logs -n flux-system deployment/source-controller
 kubectl logs -n flux-system deployment/kustomize-controller
 
-# Force reconciliation
-flux reconcile source git flux-system
-flux reconcile kustomization flux-system
+flux reconcile source git orion-staging -n flux-system
+flux reconcile kustomization orion-staging-flux-system -n flux-system
 ```
 
-#### 4. Key Vault Access Denied
+Object names are generated from the Flux configuration name. Confirm them with `flux get sources git -n flux-system` and `flux get kustomizations -n flux-system`.
+
+### 5. Key Vault Access Denied
 
 ```bash
-# Verify RBAC assignment
 az role assignment list \
-  --scope /subscriptions/<subscription-id>/resourceGroups/aks-infra/providers/Microsoft.KeyVault/vaults/<vault-name>
+  --scope $(az keyvault show --name kv-orion-staging-Cv1N --query id -o tsv)
 
-# Re-apply Key Vault configuration
 cd infra
-terraform apply -target=azurerm_key_vault.this
+terraform apply -target=azurerm_role_assignment.kv_admin
 ```
 
-#### 5. DNS Not Resolving
+### 6. DNS Not Resolving
 
 ```bash
-# Verify Cloudflare records
 dig grafana.orion-staging.dcinfrastructures.io
 
-# Check Terraform outputs
-terraform output cloudflare_grafana_record
+terraform output grafana_dns_record
+terraform output traefik_ip
 
-# Re-apply Cloudflare configuration
-terraform apply -target=cloudflare_record.grafana
+terraform apply -target=cloudflare_dns_record.grafana
 ```
 
 ### Logs and Diagnostics
 
 ```bash
-# AKS cluster logs
-az aks show \
-  --resource-group aks-infra \
-  --name orion-staging
+az aks show --resource-group aks-infra --name orion-staging
 
-# Node logs
 kubectl get nodes
 kubectl describe node <node-name>
-
-# Pod logs
 kubectl logs -n <namespace> <pod-name>
 
-# Terraform debug
 export TF_LOG=DEBUG
 terraform plan
 ```
 
 ### Cleanup and Undeployment
 
-**Automated cleanup:**
+**Automated** (`terraform destroy -auto-approve`, no confirmation):
 
 ```bash
 ./tf-undeploy.sh
 ```
 
-**Manual cleanup:**
+This destroys `infra/`, then `tf_state_store/`, and deletes the local `.terraform`, lock file and state files in both directories. Destroying the state store deletes the remote state along with it.
+
+**Manual:**
 
 ```bash
-# Destroy main infrastructure
 cd infra
 terraform destroy
 
-# Destroy state backend (WARNING: deletes all state)
+# WARNING: deletes the remote state storage
 cd ../tf_state_store
 terraform destroy
 ```
 
 ## Contributing
 
-When making changes:
-
 1. Create a feature branch
-2. Make changes and test locally
-3. Run `terraform fmt` to format code
-4. Run `terraform validate` to check syntax
-5. Submit pull request with description of changes
-
-## Support
-
-For issues or questions:
-
-- Check [Troubleshooting](#troubleshooting) section
-- Review Terraform plan output
-- Check Azure Portal for resource status
-- Review Flux logs for GitOps issues
+2. Run `terraform fmt` and `terraform validate` in the directory you changed
+3. Run `terraform plan` and review the output
+4. Submit a pull request describing the change
 
 ## References
 
-- [Terraform Azure Provider Documentation](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs)
+- [Terraform Azure Provider](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs)
 - [Azure AKS Documentation](https://docs.microsoft.com/en-us/azure/aks/)
-- [Flux CD Documentation](https://fluxcd.io/docs/)
+- [Flux Documentation](https://fluxcd.io/docs/)
+- [AKS Flux extension (GitOps)](https://learn.microsoft.com/en-us/azure/azure-arc/kubernetes/conceptual-gitops-flux2)
 - [Cilium Documentation](https://docs.cilium.io/)
-- [Cloudflare API Documentation](https://developers.cloudflare.com/api/)
+- [CloudNativePG Documentation](https://cloudnative-pg.io/documentation/)
+- [Cloudflare Terraform Provider](https://registry.terraform.io/providers/cloudflare/cloudflare/latest/docs)
